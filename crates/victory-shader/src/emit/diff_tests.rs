@@ -1360,7 +1360,7 @@ fn translated_compute_matches_pc() {
                 // The third output word is deliberately integer/bitwise;
                 // unlike float arithmetic it must match exactly.
                 if name.starts_with("seeded arithmetic") && at % 4 == 2 {
-                    a != b
+                    **a != **b
                 } else {
                     !close(**a, **b)
                 }
