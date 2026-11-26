@@ -1082,6 +1082,42 @@ fn close(a: u32, b: u32) -> bool {
         || x.is_normal() && y.is_normal() && (x - y).abs() <= 1e-3 * y.abs().max(1.0)
 }
 
+/// Deterministic shader cases generated from a fixed seed. These exercise
+/// combinations of scalar arithmetic, conversions, bitwise operations and
+/// address arithmetic through the same GPU-vs-GPU differential harness as
+/// the hand-written cases. A fixed seed makes every failure reproducible.
+fn seeded_compute_cases() -> Vec<(String, String)> {
+    let mut state = 0x6D2B_79F5u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        state
+    };
+    (0..24)
+        .map(|case| {
+            let coefficient = |n: u32| (n % 2049) as f32 / 512.0 - 2.0;
+            let a = coefficient(next());
+            let b = coefficient(next());
+            let c = coefficient(next());
+            let divisor = 0.5 + (next() % 1024) as f32 / 512.0;
+            let limit = 1.0 + (next() % 4096) as f32 / 256.0;
+            let factor = coefficient(next()).abs() + 0.125;
+            let xmul = next() | 1;
+            let ymul = next() | 1;
+            let src = format!(
+                r#"CS {{
+                    uint n = d.y * 16 + d.x;
+                    float x = float(d.x) * {a:.8} + float(d.y) * {b:.8} + k.x;
+                    float y = (x * {c:.8} + k.y) / {divisor:.8};
+                    float z = min(abs(y), {limit:.8}) + frac(x * {factor:.8});
+                    uint bits = asuint(x) ^ (d.x * {xmul}u) ^ (d.y * {ymul}u);
+                    outb.Store4(16 * n, uint4(asuint(x), asuint(y), bits, asuint(z)));
+                }}"#
+            );
+            (format!("seeded arithmetic {case:02}"), src)
+        })
+        .collect()
+}
+
 #[test]
 fn translated_compute_matches_pc() {
     use super::host::{Dispatch, Stride, View};
@@ -1187,9 +1223,14 @@ fn translated_compute_matches_pc() {
     let mut failures = Vec::new();
     let only = std::env::var("VICTORY_DIFF_ONLY").ok();
     let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-    for (name, src) in CS_CASES
+    let mut cases: Vec<(String, String)> = CS_CASES
         .iter()
-        .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
+        .map(|(name, src)| ((*name).to_owned(), (*src).to_owned()))
+        .collect();
+    cases.extend(seeded_compute_cases());
+    for (name, src) in cases
+        .iter()
+        .filter(|c| only.as_ref().is_none_or(|o| o == &c.0))
         .filter(|c| warp || !c.0.starts_with("terminates"))
     {
         let console_cs = compile(&console, &dir, src, "cs", "cs_6_5");
@@ -1315,7 +1356,15 @@ fn translated_compute_matches_pc() {
             .flatten()
             .zip(theirs.iter().flatten())
             .enumerate()
-            .find(|(_, (a, b))| !close(**a, **b));
+            .find(|(at, (a, b))| {
+                // The third output word is deliberately integer/bitwise;
+                // unlike float arithmetic it must match exactly.
+                if name.starts_with("seeded arithmetic") && *at % 4 == 2 {
+                    **a != **b
+                } else {
+                    !close(**a, **b)
+                }
+            });
         match mismatch {
             None => eprintln!("{name}: equal"),
             Some((at, (a, b))) => failures.push(format!(
