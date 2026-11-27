@@ -306,8 +306,21 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
-/// The copies in the card's memory.
+/// The copies in the card's memory. Kept for diagnostics and full enumerations.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// O(1) lookup for copies whose CPU side changed. The hot submission path
+/// drains only IDs placed in CARD_TOUCHED instead of walking every card copy.
+static CARD_BY_ID: Mutex<std::collections::HashMap<u64, std::sync::Weak<Shadow>>> =
+    Mutex::new(std::collections::HashMap::new());
+static CARD_TOUCHED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static CARD_DIRTY_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn register_carded(shadow: &Arc<Shadow>) {
+    let weak = Arc::downgrade(shadow);
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak.clone());
+    CARD_BY_ID.lock().unwrap_or_else(|e| e.into_inner()).insert(shadow.id, weak);
+}
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -616,33 +629,50 @@ impl SentRuns {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    // Each copy enters this queue only on its clean -> touched transition.
+    // Taking the queue is short; writers can enqueue the next generation
+    // while this submission consumes the current one.
+    let ids = {
+        let mut touched = CARD_TOUCHED.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *touched)
+    };
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
+    let mut by_id = CARD_BY_ID.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(shadow) = by_id.get(&id).and_then(std::sync::Weak::upgrade) else {
+            by_id.remove(&id);
+            continue;
         };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.forget(fetched);
-                    sent.note_joined(sent_as, ranges.clone());
-                }
-                ranges
-            })
-            .unwrap_or_default();
+        let Some(card) = shadow.card.as_ref() else {
+            continue;
+        };
+        // A writer racing this take either lands in this batch or enqueues
+        // the next one after observing the cleared flag.
+        if !card.touched.swap(false, Ordering::AcqRel) {
+            continue;
+        }
+        let ranges = {
+            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            joined(std::mem::take(&mut *dirty))
+        };
+        if relay() {
+            let mut sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            sent.forget(fetched);
+            sent.note_joined(sent_as, ranges.clone());
+        }
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
-        true
-    });
+    }
+    drop(by_id);
+
+    // Keep diagnostic enumeration bounded without putting a full-registry
+    // retain back on every submission.
+    if CARD_DIRTY_CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(1024) {
+        CARD_BY_ID.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, weak| weak.strong_count() > 0);
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| weak.strong_count() > 0);
+    }
     out
 }
 
@@ -4394,8 +4424,12 @@ impl Shadow {
                 _ => dirty.push((from, to)),
             }
         }
-        // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        // (Under the dirty lock: what takes the queue sees these ranges.)
+        // Enqueue only on the clean -> touched transition, so a busy copy
+        // contributes one ID no matter how many writes it receives.
+        if !card.touched.swap(true, Ordering::AcqRel) {
+            CARD_TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(self.id);
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -5294,7 +5328,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            register_carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -5500,7 +5534,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    register_carded(&shadow);
     Some(shadow)
 }
 
@@ -5604,7 +5638,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        register_carded(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
