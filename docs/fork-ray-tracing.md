@@ -97,6 +97,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
+| `VICTORY_BVH_FAULTS_ALL=<n>` | pages taken from faults in all (2048). Do not raise it: run rtf-2 (no bound) gave every committed page a copy, still had 110-730 faulted pages a frame of memory that is not the title's, and filled the 3 GiB of pages in 4 minutes (reports/RT-FLICKER.md) |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
@@ -161,6 +162,28 @@ fork's constant.
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
 
 It is off while the builder runs.
+
+### Limit reflection brightness with the builder off
+
+`VICTORY_AMBIENT_REFLECT` caps reflection brightness at a multiple of the
+ambient estimate and preserves hue. For a comparison with ray tracing off,
+keep the usual launcher settings and add `-More $reflectionHold`.
+
+```powershell
+$reflectionHold = @{
+    VICTORY_AMBIENT = '0.8'
+    VICTORY_AMBIENT_REFLECT = '1'
+    VICTORY_AMBIENT_REFLECT_IN = 'CS_TemporalResolve2_Opaque,CS_TemporalResolve1_Alpha'
+}
+```
+
+The two names are case-sensitive shader name prefixes for the opaque and
+alpha resolves. The `held=1` startup message confirms the option was parsed.
+Look for `the reflection hold is enabled` and a nonzero `direct` or
+`indirect_gated` count in the resolve summary to confirm a hold was recorded.
+The counters also report direct dispatches with zero groups, counted indirect
+dispatches and indirect dispatches with multiple records.
+[Original reflection hold](https://github.com/avatarmanz/VIctory-7900XTX/pull/314)
 
 ## Where to look
 

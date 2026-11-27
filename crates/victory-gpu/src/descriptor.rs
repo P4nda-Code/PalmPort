@@ -89,18 +89,32 @@ impl Heap {
             return None;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = self.host.get() {
+            return h.as_ref();
+        }
         // A recorder can take the fast path as soon as the OnceLock is
-        // initialized. Publish only after replaying the queued writes.
-        self.host
-            .get_or_init(|| {
-                let step = u64::from(increment(self.desc.kind)?);
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
-                for i in pending.drain(..) {
-                    h.mirror(i, self.start + u64::from(i) * step, false);
-                }
-                Some(h)
-            })
-            .as_ref()
+        // initialized. Build and replay queued writes outside `SYNC_ROUNDS`,
+        // then publish `self.host` and raise the heap-sync floor in one
+        // `SYNC_ROUNDS` critical section so no thread that observes `Some` on
+        // the fast path can reach `begin_sync_heaps_for` before the floor is
+        // raised. Lock order is `pending` -> `SYNC_ROUNDS` (nothing takes the
+        // reverse).
+        let built = increment(self.desc.kind).and_then(|step| {
+            let step = u64::from(step);
+            let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
+            for i in pending.drain(..) {
+                h.mirror(i, self.start + u64::from(i) * step, false);
+            }
+            Some(h)
+        });
+        if built.is_some() && sync_aside() {
+            let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self.host.set(built);
+            rounds.note_heap();
+        } else {
+            let _ = self.host.set(built);
+        }
+        self.host.get().and_then(|h| h.as_ref())
     }
 
     /// The handle of descriptor `index` of this heap.
@@ -199,17 +213,102 @@ fn sync_early() -> Option<std::time::Duration> {
     })
 }
 
-/// The thread's work: rounds asked for, rounds done.
+/// State of the asynchronous heap-sync worker (`victory-heap-sync`).
 #[cfg(windows)]
-static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
+#[derive(Default)]
+struct SyncRounds {
+    /// Highest round number requested by a submission.
+    asked: u64,
+    /// Rounds started by the worker (incremented before `sync_heaps()` runs,
+    /// for both asked and early rounds).
+    started: u64,
+    /// Rounds completed by the worker (incremented after `sync_heaps()`
+    /// finishes, for both asked and early rounds).
+    done: u64,
+    /// Minimum round required after a shader-visible host heap is lazily
+    /// initialized (e.g. during `VICTORY_THIN=1` translation after enqueue):
+    /// earlier rounds skipped that heap while its `OnceLock` was empty.
+    floor: u64,
+}
+
+#[cfg(windows)]
+impl SyncRounds {
+    /// Minimum round number that is guaranteed to start *after* any title
+    /// descriptor write already visible to this thread.
+    fn stamp(&self) -> u64 {
+        self.started + 1
+    }
+
+    /// Raises `floor` after a new host heap has been published into
+    /// `Heap::host`, so stamped submissions wait for a round that observes it.
+    fn note_heap(&mut self) {
+        self.floor = self.floor.max(self.started + 1);
+    }
+
+    /// Determines the round a caller must wait for (if any) and updates
+    /// `asked`. Returns `(wait_for_round, should_notify)`.
+    fn request(&mut self, stamp: Option<u64>) -> (Option<u64>, bool) {
+        let mine = match stamp {
+            Some(s) if s > 0 => {
+                let need = s.max(self.floor);
+                if self.done >= need {
+                    return (None, false);
+                }
+                need
+            }
+            _ => self.started + 1,
+        };
+        let notify = self.asked < mine;
+        if notify {
+            self.asked = mine;
+        }
+        (Some(mine), notify)
+    }
+
+    /// Whether a caller is waiting for a round that has not finished yet.
+    fn has_asked(&self) -> bool {
+        self.asked > self.done
+    }
+
+    /// Marks the start of a round (before `sync_heaps()` reads write-watch).
+    fn start_round(&mut self) {
+        self.started += 1;
+    }
+
+    /// Marks the completion of a round (after `sync_heaps()` finishes).
+    fn finish_round(&mut self) {
+        self.done += 1;
+    }
+}
+
+/// The thread's work: rounds asked for, started, done, and new-heap floor.
+#[cfg(windows)]
+static SYNC_ROUNDS: (std::sync::Mutex<SyncRounds>, std::sync::Condvar) = (
+    std::sync::Mutex::new(SyncRounds { asked: 0, started: 0, done: 0, floor: 0 }),
+    std::sync::Condvar::new(),
+);
+
+/// Returns the earliest heap-sync round guaranteed to begin *after* title
+/// descriptor writes made up to this moment (used both to stamp submissions at
+/// enqueue time in `queue::behind::submit` and to raise a queue's post-wait
+/// floor when a wait is met). Returns `0` when asynchronous heap sync is off.
+#[cfg(windows)]
+pub(crate) fn heap_sync_stamp() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).stamp()
+}
 
 /// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
 /// when this returns.
 #[cfg(windows)]
 pub(crate) struct SyncedHeaps(Option<u64>);
 
+/// Begins (or reuses an already-completed/in-flight) heap-sync round that
+/// covers all title descriptor writes up to `stamp` (or up to now if `None`).
 #[cfg(windows)]
-pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
+pub(crate) fn begin_sync_heaps_for(stamp: Option<u64>) -> SyncedHeaps {
     if !sync_aside() {
         sync_heaps();
         return SyncedHeaps(None);
@@ -219,12 +318,14 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
             crate::cores::keep_on_fast_cores("victory-heap-sync");
+            // (The submitting thread waits for its rounds.)
+            let mut priority = crate::cores::Priority::new();
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-            /// A round is over, however it ends.
+            /// A round is over, however it ends (asked or early).
             struct Over;
             impl Drop for Over {
                 fn drop(&mut self) {
-                    SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+                    SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).finish_round();
                     SYNC_ROUNDS.1.notify_all();
                 }
             }
@@ -232,25 +333,30 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
             let mut last = std::time::Instant::now();
             loop {
                 let mut r = rounds();
-                let mut asked = r.0 != r.1;
+                let mut asked = r.has_asked();
                 while !asked {
                     let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
                         r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
-                        asked = r.0 != r.1;
+                        asked = r.has_asked();
                         continue;
                     };
                     let (back, over) = SYNC_ROUNDS.1.wait_timeout(r, every).unwrap_or_else(|e| e.into_inner());
                     r = back;
-                    asked = r.0 != r.1;
+                    asked = r.has_asked();
                     if over.timed_out() {
                         break;
                     }
                 }
+                // Count the round as started *before* releasing the lock and
+                // calling `sync_heaps()`, so any submission stamped after this
+                // point knows it must wait for the next round.
+                r.start_round();
                 drop(r);
-                let _over = asked.then(|| {
+                priority.keep();
+                if asked {
                     last = std::time::Instant::now();
-                    Over
-                });
+                }
+                let _over = Over;
                 let _round =
                     crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
                 let _ = std::panic::catch_unwind(sync_heaps);
@@ -263,38 +369,38 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
         return SyncedHeaps(None);
     }
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    rounds.0 += 1;
-    let mine = rounds.0;
+    let (mine, notify) = rounds.request(stamp);
     drop(rounds);
-    SYNC_ROUNDS.1.notify_all();
-    SyncedHeaps(Some(mine))
+    if notify {
+        SYNC_ROUNDS.1.notify_all();
+    }
+    SyncedHeaps(mine)
 }
 
-/// Renderer port #7 (`crate::port_journal`, from renderer patch #4): [`begin_sync_heaps`] for a
+/// Renderer port #7 (`crate::port_journal`, from renderer patch #4): [`begin_sync_heaps_for`] for a
 /// submission that needs round `mark` (one that began after what it waits
-/// for was written, `crate::port_journal::round_after`): asked for if it has not
-/// been. 0: as [`begin_sync_heaps`].
+/// for was written, via [`crate::port_journal::prep_wrote`]): asked for if it has not
+/// been. 0: as [`begin_sync_heaps_for`] without a stamp.
 #[cfg(windows)]
 pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
     if mark == 0 || !sync_aside() {
-        return begin_sync_heaps();
+        return begin_sync_heaps_for(None);
     }
-    // (The thread is started by the first `begin_sync_heaps`.)
+    // (The thread is started by the first `begin_sync_heaps_for`.)
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    if rounds.1 == 0 && rounds.0 == 0 {
+    if rounds.done == 0 && rounds.asked == 0 {
         drop(rounds);
-        return begin_sync_heaps();
+        return begin_sync_heaps_for(None);
     }
-    let asked = rounds.0 < mark;
-    rounds.0 = rounds.0.max(mark);
+    let (mine, notify) = rounds.request(Some(mark));
     drop(rounds);
-    if asked {
+    if notify {
         SYNC_ROUNDS.1.notify_all();
         crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
         crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    SyncedHeaps(Some(mark))
+    SyncedHeaps(mine)
 }
 
 /// Renderer port #7: the number of a round of the heaps' records that
@@ -308,12 +414,12 @@ pub(crate) fn round_after_now() -> u64 {
         return 0;
     }
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    if rounds.1 == 0 && rounds.0 == 0 {
+    if rounds.done == 0 && rounds.asked == 0 {
         return 0;
     }
-    let (round, ask) = crate::port_journal::round_after(rounds.0, rounds.1);
-    if ask {
-        rounds.0 = round;
+    let round = rounds.stamp();
+    if rounds.asked < round {
+        rounds.asked = round;
         drop(rounds);
         SYNC_ROUNDS.1.notify_all();
         crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -323,16 +429,20 @@ pub(crate) fn round_after_now() -> u64 {
 
 /// Renderer port #7: the number of the first round that begins after this
 /// call, not asked for ([`begin_sync_heaps_after`] asks for it if nobody did).
+/// Also raises `SyncRounds::floor` so stamped submissions queued before a
+/// preparation-time write to a placed descriptor heap still wait for a round
+/// that observes it.
 #[cfg(windows)]
 pub(crate) fn round_mark() -> u64 {
     if !sync_aside() {
         return 0;
     }
-    let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    if rounds.1 == 0 && rounds.0 == 0 {
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.done == 0 && rounds.asked == 0 {
         return 0;
     }
-    rounds.0 + 1
+    rounds.note_heap();
+    rounds.floor
 }
 
 /// Whether `[at, at + len)` touches the title memory of a placed
@@ -343,6 +453,23 @@ pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
     SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| from < end && start < to)
 }
 
+/// Whether any `(from, to)` title-address range in `ranges` overlaps a placed
+/// shader-visible heap of descriptors, holding `SHADER_HEAPS` read lock once.
+#[cfg(windows)]
+pub(crate) fn any_in_shader_heap(ranges: impl IntoIterator<Item = (usize, usize)>) -> bool {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if heaps.is_empty() {
+        return false;
+    }
+    ranges.into_iter().any(|(from, to)| {
+        if to <= from {
+            return false;
+        }
+        let (from, to) = (from as u64, to as u64);
+        heaps.iter().any(|&(start, end, _)| from < end && start < to)
+    })
+}
+
 #[cfg(windows)]
 impl Drop for SyncedHeaps {
     fn drop(&mut self) {
@@ -351,7 +478,7 @@ impl Drop for SyncedHeaps {
         };
         let began = std::time::Instant::now();
         let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-        while rounds.1 < mine {
+        while rounds.done < mine {
             rounds = SYNC_ROUNDS.1.wait(rounds).unwrap_or_else(|e| e.into_inner());
         }
         drop(rounds);
@@ -428,10 +555,7 @@ pub(crate) fn sync_heaps() {
             // calls marked, in place of the changed pages; and a few of the
             // pages the watch says were written, looked at whole.
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
-            for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
-                let from = start as usize + first as usize * step as usize;
-                parts.push((from, from + n as usize * step as usize, false));
-            }
+            let marked = crate::port_descriptors::take(start).unwrap_or_default();
             phase.end();
             if crate::port_descriptors::ask_due(frame) {
                 let began = std::time::Instant::now();
@@ -441,9 +565,13 @@ pub(crate) fn sync_heaps() {
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
-            for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
-            }
+            parts = port_scan_parts(
+                &marked,
+                crate::port_descriptors::to_check(frame),
+                start as usize,
+                end as usize,
+                step as usize,
+            );
         } else {
             let began = std::time::Instant::now();
             let phase = crate::timeline::span("the heaps' records: asking");
@@ -751,6 +879,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     crate::port_descriptors::line(frames);
+    crate::draw::in_place_indirect_line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -825,6 +954,51 @@ fn changed_slots(
     first.min(last)..last
 }
 
+/// Marks own their slots, even if a wider fallback read would fail. The
+/// fallback takes only the complete slots between the sorted marked runs.
+/// The write watch supplies each fallback page at most once.
+#[cfg(windows)]
+fn port_scan_parts(
+    marked: &[(u32, u32)],
+    pages: Vec<usize>,
+    heap_start: usize,
+    heap_end: usize,
+    step: usize,
+) -> Vec<(usize, usize, bool)> {
+    let mut parts: Vec<_> = marked
+        .iter()
+        .map(|&(first, count)| {
+            let from = heap_start + first as usize * step;
+            (from, from + count as usize * step, false)
+        })
+        .collect();
+    let marked_parts = parts.len();
+    for page in pages {
+        let from = page.max(heap_start);
+        let to = (page + crate::watch::PAGE).min(heap_end);
+        if from >= to {
+            continue;
+        }
+        let mut from = heap_start + (from - heap_start).div_ceil(step) * step;
+        let to = heap_start + (to - heap_start) / step * step;
+        let first_mark = parts[..marked_parts].partition_point(|&(_, end, _)| end <= from);
+        for n in first_mark..marked_parts {
+            let (mark_from, mark_to, _) = parts[n];
+            if from >= to || mark_from >= to {
+                break;
+            }
+            if from < mark_from {
+                parts.push((from, mark_from, true));
+            }
+            from = mark_to;
+        }
+        if from < to {
+            parts.push((from, to, true));
+        }
+    }
+    parts
+}
+
 /// The title's view heap that shaders of a list without one get their views
 /// from (`draw.rs`, `bind`): the title's structure builder binds root views
 /// only, and the host shows those, and memory by address, through heap slots.
@@ -856,15 +1030,15 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if its host heap still has the identity that took the slots.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
@@ -1049,6 +1223,18 @@ pub(crate) enum View {
 }
 
 impl View {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn kind_index(&self) -> usize {
+        match self {
+            Self::Constant(..) => 0,
+            Self::Shader(..) => 1,
+            Self::Unordered(..) => 2,
+            Self::Sampler(..) => 3,
+            Self::ConsoleSampler(..) => 4,
+            Self::Placed(..) => 5,
+        }
+    }
+
     /// Whether the view reads buffer memory (constant buffers, buffer views
     /// of resources or of memory) or memory the title placed a texture in:
     /// such views get host slots only for draws.
@@ -1090,13 +1276,10 @@ impl View {
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
-    /// How many entries of [`list`](Self::list) hold a constant buffer view
-    /// and how many a view of placed memory (freed ones included, as they
-    /// still hold their view until reused), kept as entries change rather
-    /// than counted for the memory line: that walk over every entry took
-    /// up to 49 ms at 30 million entries.
+    /// Count slot changes so the memory log never has to walk the table.
+    /// A free slot counts toward the kind it last held until it is reused.
     #[cfg(all(windows, feature = "diagnostics"))]
-    address_entries: [u64; 2],
+    kind_usage: [ViewKindUsage; 6],
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -1114,6 +1297,21 @@ struct Views {
     ownerless: std::collections::VecDeque<(u32, u32)>,
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ViewKindUsage {
+    pub(crate) occupied: u64,
+    pub(crate) free: u64,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+impl ViewKindUsage {
+    /// Bytes in the slots themselves, excluding spare capacity and indexes.
+    pub(crate) fn slot_bytes(self) -> u64 {
+        (self.occupied + self.free) * size_of::<(View, u32)>() as u64
+    }
+}
+
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
@@ -1121,7 +1319,7 @@ struct Views {
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     #[cfg(all(windows, feature = "diagnostics"))]
-    address_entries: [0, 0],
+    kind_usage: [ViewKindUsage { occupied: 0, free: 0 }; 6],
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
@@ -1341,21 +1539,19 @@ impl Views {
         if current != generation || self.index.get(&view) != Some(&i) {
             return;
         }
-        self.index.remove(&view);
-        self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
-        self.free.push(i);
+        self.free_entry(i, &view, generation);
     }
 
-    /// Counts `view` in or out of [`address_entries`](Self::address_entries).
-    #[cfg(all(windows, feature = "diagnostics"))]
-    fn count_address(&mut self, view: &View, added: bool) {
-        let kind = match view {
-            View::Constant(..) => 0,
-            View::Placed(..) => 1,
-            _ => return,
-        };
-        let n = &mut self.address_entries[kind];
-        *n = if added { *n + 1 } else { n.saturating_sub(1) };
+    fn free_entry(&mut self, i: u32, view: &View, generation: u32) {
+        self.index.remove(view);
+        self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        {
+            let usage = &mut self.kind_usage[view.kind_index()];
+            usage.occupied -= 1;
+            usage.free += 1;
+        }
+        self.free.push(i);
     }
 
     fn entry_made(&mut self, view: View) -> [u32; 2] {
@@ -1365,7 +1561,10 @@ impl Views {
                 let i = match self.free.pop() {
                     Some(i) => {
                         #[cfg(all(windows, feature = "diagnostics"))]
-                        self.count_address(&self.list[i as usize].0.clone(), false);
+                        {
+                            let old_kind = self.list[i as usize].0.kind_index();
+                            self.kind_usage[old_kind].free -= 1;
+                        }
                         self.list[i as usize].0 = view.clone();
                         i
                     }
@@ -1375,7 +1574,9 @@ impl Views {
                     }
                 };
                 #[cfg(all(windows, feature = "diagnostics"))]
-                self.count_address(&view, true);
+                {
+                    self.kind_usage[view.kind_index()].occupied += 1;
+                }
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
                     self.by_resource.entry(r).or_default().push(i);
                 }
@@ -1436,27 +1637,29 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// buffer views and views of placed memory (those that did not fit a
 /// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
 /// placed views kept, and the views named whole in their records since the
-/// start: constant buffer views, views of placed memory.
+/// start: constant buffer views, views of placed memory. Both the summary and
+/// the per-kind slot counts come from the same read lock.
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn views_kept() -> [u64; 8] {
+pub(crate) fn views_kept() -> ([u64; 8], [ViewKindUsage; 6]) {
     use std::sync::atomic::Ordering::Relaxed;
     let views = views_read();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
-    let [constants, placed] = views.address_entries;
-    [
+    let [constant, .., placed] = views.kind_usage;
+    let summary = [
         views.list.len() as u64,
         views.free.len() as u64,
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
             + views.shapes.capacity() as u64 * shape
             + views.shape_index.len() as u64 * size_of::<(u64, u32)>() as u64 * 3 / 2,
-        constants,
-        placed,
+        constant.occupied + constant.free,
+        placed.occupied + placed.free,
         views.shapes.len() as u64,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
-    ]
+    ];
+    (summary, views.kind_usage)
 }
 
 impl View {
@@ -1602,12 +1805,9 @@ pub(crate) fn forget(resource: usize) {
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
-        views.index.remove(&view);
-        // (Below the bits that say a record is no table entry.)
-        views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
-        views.free.push(i);
+        views.free_entry(i, &view, generation);
     }
 }
 
@@ -2007,6 +2207,48 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn marked_and_fallback_scans_own_disjoint_slots() {
+        let page = crate::watch::PAGE;
+        let step = 32;
+        let start = page;
+        let per_page = (page / step) as u32;
+        let marked = [(per_page - 1, 2), (per_page + 4, 2), (3 * per_page - 1, 2)];
+        let parts = port_scan_parts(
+            &marked,
+            vec![start + 3 * page, start + page],
+            start,
+            start + 4 * page,
+            step,
+        );
+        assert_eq!(
+            parts,
+            [
+                (start + page - step, start + page + step, false),
+                (start + page + 4 * step, start + page + 6 * step, false),
+                (start + 3 * page - step, start + 3 * page + step, false),
+                (start + 3 * page + step, start + 4 * page, true),
+                (start + page + step, start + page + 4 * step, true),
+                (start + page + 6 * step, start + 2 * page, true),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_mark_owns_its_slot_when_the_slot_straddles_a_fallback_page() {
+        let page = crate::watch::PAGE;
+        let step = 32;
+        let start = page - step / 2;
+        let marked = [(0, 2)];
+        let parts = port_scan_parts(&marked, vec![page], start, start + 2 * page, step);
+        assert_eq!(
+            parts,
+            [(start, start + 2 * step, false), (start + 2 * step, start + page, true)]
+        );
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
@@ -2077,8 +2319,19 @@ mod tests {
                 )
             };
             assert!(!host.made(5));
-            sync_heaps();
-            assert!(host.made(5));
+            // Another test's begin_sync_heaps_for can have the heap-sync thread
+            // running a sync of its own: that one may take this page's write
+            // and make the record a moment after this sync returns.
+            let mut made = false;
+            for _ in 0..200 {
+                sync_heaps();
+                made = host.made(5);
+                if made {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(made);
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
@@ -2211,21 +2464,30 @@ mod tests {
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
     }
 
-    /// The counts of constant buffer and placed entries the memory line
-    /// reads follow the table as a walk over it would count: a freed entry
-    /// reused for another kind is counted out and in.
+    /// Each slot is counted once as it is freed and reused across kinds.
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn diagnostic_counts_follow_distinct_entries_including_reused_slots() {
-        let walk = |views: &Views| {
-            let count = |f: fn(&View) -> bool| views.list.iter().filter(|(v, _)| f(v)).count() as u64;
-            [count(|v| matches!(v, View::Constant(..))), count(|v| matches!(v, View::Placed(..)))]
+        let check = |views: &Views| {
+            let mut expected = [ViewKindUsage::default(); 6];
+            for view in views.index.keys() {
+                expected[view.kind_index()].occupied += 1;
+            }
+            for &i in &views.free {
+                expected[views.list[i as usize].0.kind_index()].free += 1;
+            }
+            assert_eq!(views.kind_usage, expected);
+            assert_eq!(
+                expected.iter().map(|usage| usage.slot_bytes()).sum::<u64>(),
+                (views.list.len() * size_of::<(View, u32)>()) as u64
+            );
         };
         let mut views = Views::default();
-        // A slot freed by forget still holds the old resource view, with its
-        // new generation; it can be reused for a view without a resource.
-        views.list.push((View::Shader(1, None), 2));
-        views.free.push(0);
+        let shader = View::Shader(1, None);
+        let [i, generation] = views.entry(shader.clone());
+        views.free_entry(i, &shader, generation);
+        assert_eq!(views.kind_usage[1], ViewKindUsage { occupied: 0, free: 1 });
+        check(&views);
         let constant = View::Constant(0x1234, 256);
         assert_eq!(views.entry(constant.clone()), [0, 2]);
         assert_eq!(views.entry(constant), [0, 2]);
@@ -2233,16 +2495,18 @@ mod tests {
         let index = views.entry(placed.clone());
         assert_eq!(views.entry(placed), index);
         views.entry(View::Unordered(1, 2, None));
-        assert_eq!(views.address_entries, [1, 1]);
-        assert_eq!(views.address_entries, walk(&views));
+        views.entry(View::Sampler([0; 13]));
+        views.entry(View::ConsoleSampler([0; 27]));
+        assert_eq!(views.kind_usage.map(|usage| usage.occupied), [1, 0, 1, 1, 1, 1]);
+        check(&views);
         // Under a cap of 2, placed views push the constant one out; its
         // freed entry, reused, changes kind.
         for n in 1..6u32 {
             views.entry_kept(View::Placed(false, [n; 14], [n; 16]), 2);
-            assert_eq!(views.address_entries, walk(&views), "after placed view {n}");
+            check(&views);
         }
         views.entry_kept(View::Constant(0x5678, 512), 2);
-        assert_eq!(views.address_entries, walk(&views), "a constant view in a freed entry");
+        check(&views);
     }
 
     /// Entries of views no resource releases stay under their cap: the
@@ -2383,5 +2647,113 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    /// Load test (`cargo test -p victory-gpu --lib --locked placed_view_shapes_load -- --ignored --nocapture`).
+    /// A million placed views whose descriptions differ only in padding words
+    /// make one shape; a million that really differ make a million. Then each
+    /// description word is varied alone, to list the words that tell shapes apart.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "load test: about a million table inserts"]
+    fn placed_view_shapes_load() {
+        use crate::loadprobe::{mix, private_bytes};
+        const N: u64 = 1_000_000;
+        let shapes = || VIEWS.read().unwrap().shapes.len();
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        // A 2D texture SRV (dimension 4): the union's words 4-7 are used; 3, 8 and 9 are padding.
+        let resource = [3, 0, 0, 0, 0x4321, 0, 0x4321, 0x10001, 28, 1, 0, 0, 0, 0];
+        let desc = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0, 0x2000, 0x6, 0, 0, 0, 0];
+        let before = (shapes(), private_bytes());
+        for n in 0..N {
+            let mut r = resource;
+            r[1] = mix(n);
+            r[13] = mix(n + N);
+            let mut d = desc;
+            (d[3], d[8], d[9]) = (mix(n + 2 * N), mix(n + 3 * N), mix(n + 4 * N));
+            let address = 0xd_0000_0000 + n * 0x1_0000;
+            (d[10], d[11]) = (address as u32, (address >> 32) as u32);
+            create_placed_srv(null, &r, &d, handle);
+        }
+        let padding = (shapes() - before.0, private_bytes().saturating_sub(before.1));
+        eprintln!("padding only: {N} views -> {} new shapes, private memory +{} KiB", padding.0, padding.1 >> 10);
+        // Control: the mip level (word 4) really differs.
+        let mid = (shapes(), private_bytes());
+        for n in 0..N / 10 {
+            let mut d = desc;
+            (d[4], d[5]) = (n as u32 + 1, 0);
+            create_placed_srv(null, &resource, &d, handle);
+        }
+        let control = (shapes() - mid.0, private_bytes().saturating_sub(mid.1));
+        eprintln!("control: {} really different views -> {} new shapes, private memory +{} KiB", N / 10, control.0, control.1 >> 10);
+        assert_eq!(control.0 as u64, N / 10, "views that differ are shapes");
+        // One word at a time, 64 values each, from a base the other tests do not use.
+        let mut identity = Vec::new();
+        for (name, count) in [("resource", 14usize), ("view", 16)] {
+            for w in 0..count {
+                if name == "view" && (w == 10 || w == 11) {
+                    continue; // the address
+                }
+                let base = shapes();
+                for v in 0..64u32 {
+                    let mut r = [3, 0, 0, 0, 0x7777, 0, 0x7777, 0x10001, 28, 1, 0, 0, 0, 0];
+                    let mut d = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0, 0x2000, 0x6, 0, 0, 0, 0];
+                    let v = 0x5000_0000 + v * 0x1111;
+                    if name == "resource" { r[w] = v } else { d[w] = v }
+                    create_placed_srv(null, &r, &d, handle);
+                }
+                let grew = shapes() - base;
+                eprintln!("{name} word {w:2}: 64 values -> {grew} shapes");
+                if grew > 2 {
+                    identity.push(format!("{name}[{w}]"));
+                }
+            }
+        }
+        eprintln!("words that tell shapes apart: {identity:?}");
+        assert!(padding.0 <= 4, "padding alone made {} shapes out of {N}", padding.0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sync_rounds_coalesce_queued_submissions_and_early_rounds() {
+        let mut r = super::SyncRounds::default();
+        // Three queued submissions enqueued before any round starts share stamp 1.
+        let s1 = r.stamp();
+        let s2 = r.stamp();
+        let s3 = r.stamp();
+        assert_eq!((s1, s2, s3), (1, 1, 1));
+        assert!(!r.has_asked());
+        // First submission triggers round 1.
+        assert_eq!(r.request(Some(s1)), (Some(1), true));
+        assert!(r.has_asked());
+        // Worker starts round 1; a submission enqueued *during* round 1 gets stamp 2.
+        r.start_round();
+        let s_during = r.stamp();
+        assert_eq!(s_during, 2);
+        // Round 1 finishes: submissions 2 and 3 need no round and no wait.
+        r.finish_round();
+        assert!(!r.has_asked());
+        assert_eq!(r.request(Some(s2)), (None, false));
+        assert_eq!(r.request(Some(s3)), (None, false));
+        // An early round runs before `s_during` is submitted, covering stamp 2.
+        r.start_round();
+        r.finish_round();
+        assert!(!r.has_asked());
+        assert_eq!(r.request(Some(s_during)), (None, false));
+        // Unstamped (synchronous) caller always demands a fresh round after `started`.
+        assert_eq!(r.request(None), (Some(3), true));
+        assert!(r.has_asked());
+        r.start_round();
+        r.finish_round();
+        assert!(!r.has_asked());
+        // Lazily creating a host heap during thin translation raises `floor`
+        // so an earlier-stamped submission cannot skip syncing the new heap.
+        r.note_heap();
+        assert_eq!(r.request(Some(s2)), (Some(4), true));
+        r.start_round();
+        r.finish_round();
+        assert_eq!(r.request(Some(s3)), (None, false));
     }
 }

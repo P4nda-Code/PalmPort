@@ -5,6 +5,39 @@ layer sends to the card, and the memory it reads) and run it again without
 the title, to see where the card's time goes and to try changes in seconds.
 Code: `crates/victory-gpu/src/replay`.
 
+## Inspect a dropped draw
+
+For one frame's operation listing, create the capture folder first. Use a
+diagnostics build and add the folder and frame number to your usual launch.
+
+```powershell
+-More @{VICTORY_CAPTURE='C:\captures\vice-tay'; VICTORY_CAPTURE_FRAMES='1000'}
+```
+
+Read `frame-1000-ops.txt` in the capture folder. A failed preparation for a
+direct draw, indexed draw or mesh dispatch includes the reason, pipeline
+recipe key and guest shader hashes when a pipeline was set. Draws that reach
+the GPU can still produce incorrect geometry, depth or materials.
+
+## Inspect the scene before frame generation
+
+With frame generation enabled, set `VICTORY_CAPTURE_SCENE_BEFORE_FRAMEGEN=1`
+and the capture folder above. List specific frames or create an empty
+`scene-next` file in that folder while the title is running. The next
+eligible present consumes the file. This mode saves requested frames only.
+Each `scene-<frame>.png` shows the scene at full output resolution before
+interpolation. The diagnostics panel and any separately submitted title UI
+are composed afterwards. A HUD already drawn into the scene stays in the
+image. The swap chain still presents with frame generation when its input is
+ready. Match the frame number and timestamp in the log to the recorded
+output. Exclude the synchronous readback from timing samples.
+
+Use an empty `scene-trace` file to save the scene with
+`frame-<frame>-ops.txt`. The title drains recording work at the beginning
+and end of the selected frame. With `VICTORY_DUMP_TARGETS=1`, the same
+request also saves the textures written during that frame. Match their
+resource IDs to the draws and dispatches in the operation list.
+
 ## Recording
 
 Off unless `VICTORY_RECORD` is set. Build with
