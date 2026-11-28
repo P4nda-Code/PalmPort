@@ -663,24 +663,47 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
+    // A pagefile-backed section of `size` bytes. SEC_COMMIT is required
+    // for D3D12's OpenExistingHeapFromFileMapping path, but the title asks
+    // for 6.1 GiB at once and a busy host often cannot commit that much
+    // (error 1450). Keep the historical reserve-first behavior on Windows;
+    // `VICTORY_SECTION_COMMIT=1` opts into trying committed sections there.
+    // Wine keeps its existing committed-section behavior: reserved sections
+    // make each later commit an expensive wineserver request.
+    let try_commit = on_wine()
+        || std::env::var("VICTORY_SECTION_COMMIT").is_ok_and(|v| v.trim() == "1");
+    let protection = PAGE_READWRITE | if try_commit { SEC_COMMIT } else { SEC_RESERVE };
     // SAFETY: plain section creation.
-    let handle = unsafe {
+    let mut handle = unsafe {
         CreateFileMappingW(
             INVALID_HANDLE_VALUE,
             std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            protection,
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
         )
     };
+    let mut committed = try_commit;
+    // If the optional full commitment exceeds the host's commit limit,
+    // preserve the old reserved-section behavior rather than failing the
+    // game's physical-page allocation.
+    if handle.is_null() && try_commit && !on_wine() {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(n, %error, "committed physical section unavailable; retrying reserved");
+        // SAFETY: retry with the historical reservation mode.
+        handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        committed = false;
+    }
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
@@ -695,12 +718,16 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
     let section = Arc::new(Section {
         handle,
         pages: n,
         window: std::sync::OnceLock::new(),
-        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        committed: (0..n.div_ceil(64)).map(|word| {
+            let remaining = n.saturating_sub(word * 64);
+            let bits = if committed { u64::MAX >> (64 - remaining.min(64)) } else { 0 };
+            std::sync::atomic::AtomicU64::new(bits)
+        }).collect(),
     });
     let mut table = page_table_mut();
     let first = table.next_page;
