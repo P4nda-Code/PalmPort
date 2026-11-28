@@ -561,7 +561,7 @@ pub(crate) fn section_page(at: usize) -> Option<(usize, u64)> {
 /// The mapping read lock keeps the section view stable while its metadata and
 /// stable side-view address are resolved.
 pub(crate) fn place_section_page(at: usize) -> Option<(Placed, usize, usize)> {
-    if std::env::var_os("VICTORY_UMA_SECTION_PAGES").as_deref() != Some(std::ffi::OsStr::new("1")) {
+    if std::env::var_os("VICTORY_UMA_SECTION_PAGES").as_deref() != Some(std::ffi::OsStr::new("1")) || crate::host::late() {
         return None;
     }
     // Caller holds `watch::title_memory_reading` across descriptor setup.
