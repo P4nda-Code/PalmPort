@@ -35,7 +35,7 @@
 //!   `VirtualProtect` fail with error 87), nor unmap a view in it. Pages
 //!   outside the opened part are free to change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -319,9 +319,46 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     v.sections.push((section, bytes, committed));
 }
 
+/// Open heaps for committed physical sections, shared by every page in
+/// the section. The D3D12 heap retains the section backing independently of
+/// the title's mapped views. Entries are removed when the runtime releases
+/// the section handle; placed resources retain their own heap references.
+static SECTION_HEAPS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, ID3D12Heap>>> = std::sync::OnceLock::new();
+
+/// The D3D12 heap for a committed title physical section. The caller must
+/// hold `crate::watch::title_memory_reading` so the section handle cannot be
+/// closed or reused while it is opened. Reserved sections are never opened.
+pub(crate) fn section_heap(section: usize) -> Option<ID3D12Heap> {
+    {
+        let v = views();
+        if !v.sections.iter().any(|s| s.0 == section && s.2) {
+            return None;
+        }
+    }
+    let heaps = SECTION_HEAPS.get_or_init(Default::default);
+    let mut heaps = heaps.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(heap) = heaps.get(&section) {
+        return Some(heap.clone());
+    }
+    let host = crate::host::host()?;
+    match open(&host.device, From::Section(section)) {
+        Ok(heap) => {
+            heaps.insert(section, heap.clone());
+            Some(heap)
+        }
+        Err(error) => {
+            tracing::warn!(section, error = %error, "could not open committed physical section as a GPU heap");
+            None
+        }
+    }
+}
+
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    if let Some(heaps) = SECTION_HEAPS.get() {
+        heaps.lock().unwrap_or_else(|e| e.into_inner()).remove(&section);
+    }
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
