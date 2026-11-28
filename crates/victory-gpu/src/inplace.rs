@@ -50,6 +50,10 @@ use windows_sys::Win32::System::Memory as mem;
 
 /// The unit heaps and placed buffers are cut on, and the console's page.
 const K64: usize = 64 << 10;
+
+/// Open D3D12 heaps for committed physical sections, retained until the
+/// runtime releases the section. Placed resources keep their own heap refs.
+static SECTION_HEAPS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, ID3D12Heap>>> = std::sync::OnceLock::new();
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
@@ -563,8 +567,7 @@ pub(crate) fn place_section_page(at: usize) -> Option<(Placed, usize, usize)> {
     let (section, offset) = section_page(at)?;
     let (data, _) = beside_page(at)?;
     let host = crate::host::host()?;
-    static HEAPS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, ID3D12Heap>>> = std::sync::OnceLock::new();
-    let mut heaps = HEAPS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let mut heaps = SECTION_HEAPS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     let heap = if let Some(heap) = heaps.get(&section) {
         heap.clone()
     } else {
