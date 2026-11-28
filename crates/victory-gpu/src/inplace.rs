@@ -535,6 +535,24 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
 }
 
+/// The committed physical-section backing of one title virtual page, if it
+/// is shown by exactly one contiguous section run. The caller must hold
+/// `crate::watch::title_memory_reading` so the title cannot remap the page
+/// while the returned handle and offset are used. The section heap can then
+/// outlive its mapped views.
+pub(crate) fn section_page(at: usize) -> Option<(usize, u64)> {
+    if !at.is_multiple_of(K64) {
+        return None;
+    }
+    let v = views();
+    let Cover::Run(section, offset) = cover_in(&v.views, at, K64) else {
+        return None;
+    };
+    let (_, bytes, committed) = v.sections.iter().find(|s| s.0 == section)?;
+    (*committed && offset.is_multiple_of(K64 as u64) && offset.checked_add(K64 as u64).is_some_and(|end| end <= *bytes))
+        .then_some((section, offset))
+}
+
 /// The whole stretch of views around `[at, at + len)` that follow one
 /// another in memory and in one section alike, if the range is one run of a
 /// section ([`Cover::Run`]): its first address, its bytes, the section and
