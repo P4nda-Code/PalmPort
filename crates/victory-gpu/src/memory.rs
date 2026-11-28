@@ -155,6 +155,9 @@ struct Memory {
     arenas: Vec<(usize, usize)>,
     /// By title page.
     pages: HashMap<u64, Held>,
+    /// Pages whose directory entry points straight into a committed physical section.
+    /// Kept separate from arena pages: they need no refresh or copy-back.
+    direct_pages: HashMap<u64, usize>,
     /// Their numbers in the order they came, and where the sweep is.
     order: Vec<u64>,
     sweep: usize,
@@ -211,6 +214,39 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// Invalidate direct physical-page directory entries before a virtual view is
+/// remapped. Their old descriptor slots remain alive for in-flight GPU work;
+/// a later lookup receives a fresh slot for the new backing page.
+pub(crate) fn forget_direct_pages(at: usize, len: usize) {
+    if len == 0 { return; }
+    let first = (at as u64) / PAGE;
+    let end = (at.saturating_add(len) as u64).div_ceil(PAGE);
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(memory) = guard.as_mut() else { return; };
+    for page in first..end {
+        if memory.direct_pages.remove(&page).is_some() {
+            // SAFETY: the directory entry is owned under MEMORY's mutex.
+            unsafe { memory.entry(page).write_volatile(0); }
+            crate::watch::wrote(memory.entry(page) as usize, 8);
+        }
+    }
+}
+
+/// A physical section is going away. Forget all virtual pages whose current
+/// directory entries point into it; retained copy slots keep old resources
+/// alive until no GPU descriptor can refer to them.
+pub(crate) fn forget_section_pages(section: usize) {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(memory) = guard.as_mut() else { return; };
+    let pages: Vec<u64> = memory.direct_pages.iter().filter_map(|(&page, &backing)| (backing == section).then_some(page)).collect();
+    for page in pages {
+        memory.direct_pages.remove(&page);
+        // SAFETY: the directory entry is owned under MEMORY's mutex.
+        unsafe { memory.entry(page).write_volatile(0); }
+        crate::watch::wrote(memory.entry(page) as usize, 8);
+    }
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -241,6 +277,7 @@ impl Memory {
             numbers: HashMap::new(),
             arenas: Vec::new(),
             pages: HashMap::new(),
+            direct_pages: HashMap::new(),
             order: Vec::new(),
             sweep: 0,
             windows: 0,
@@ -369,10 +406,23 @@ impl Memory {
             }
             return false;
         }
-        if self.pages.len() >= MOST {
+        if self.pages.len() + self.direct_pages.len() >= MOST {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
             return false;
+        }
+        // Experimental UMA path: point the directory at the physical section
+        // itself. If the driver cannot open/place this page, retain the arena
+        // copy path below. The switch is deliberately off by default.
+        if let Some((placed, data, section)) = crate::inplace::place_section_page(start as usize) {
+            let shadow = Arc::new(Shadow::placed_section(placed, data, start, PAGE));
+            let Some(n) = self.number(shadow) else {
+                return false;
+            };
+            fill(self.entry(page), n, 0);
+            crate::watch::wrote(self.entry(page) as usize, 8);
+            self.direct_pages.insert(page, section);
+            return true;
         }
         if let Some((copy, at)) = self.free.pop() {
             self.hold(page, at, copy);
@@ -903,6 +953,10 @@ pub(crate) fn ready(
     use_: Use,
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
+    // Keep physical-page metadata and its stable section view valid until all
+    // page descriptors for this dispatch have been prepared. Remapping takes
+    // the exclusive side before invalidating direct directory entries.
+    let _reading = crate::watch::title_memory_reading();
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
