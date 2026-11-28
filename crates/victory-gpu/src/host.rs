@@ -1294,6 +1294,10 @@ pub(crate) struct HostList {
     /// What its indirect executions ran, for the report of a removed device.
     #[cfg(feature = "diagnostics")]
     indirects: indirects::Shared,
+    /// Holds of physical title pages whose placed resources are read by this
+    /// list. Cleared only by reset, which is called after the list's last
+    /// submission has passed its GPU fence.
+    section_readings: Mutex<Vec<crate::watch::GpuReading>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -4410,6 +4414,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list: rec::Rec::new(list),
+                section_readings: Mutex::new(Vec::new()),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -6572,6 +6577,15 @@ impl Host {
 }
 
 impl HostList {
+    /// Obtain a placed resource for one committed physical page and retain
+    /// its CPU-write/remapping lease until this list is reset after its
+    /// final submission fence.
+    pub(crate) fn section_page_resource(&self, at: usize) -> Option<(ID3D12Resource, u64)> {
+        let (resource, gpu, reading) = crate::inplace::section_page_resource(at)?;
+        self.section_readings.lock().unwrap_or_else(|e| e.into_inner()).push(reading);
+        Some((resource, gpu))
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -6707,6 +6721,9 @@ impl HostList {
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // The list is no longer in flight: release CPU-write claims for
+        // physical pages only after its last submission has completed.
+        self.section_readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
