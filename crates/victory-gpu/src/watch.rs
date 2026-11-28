@@ -3589,6 +3589,69 @@ pub fn title_memory_remapping() -> Remapping {
     Remapping(changing)
 }
 
+/// Normalize the mapped aliases of one physical page. Reject incomplete or
+/// unexpectedly large alias sets rather than protecting only some views.
+fn physical_page_aliases(at: usize, mut aliases: Vec<usize>) -> Option<Vec<usize>> {
+    const PHYSICAL_PAGE: usize = 64 * 1024;
+    if !at.is_multiple_of(PHYSICAL_PAGE)
+        || aliases.is_empty()
+        || aliases.len() > MANY_VIEWS
+        || !aliases.contains(&at)
+        || aliases.iter().any(|page| !page.is_multiple_of(PHYSICAL_PAGE))
+    {
+        return None;
+    }
+    aliases.sort_unstable();
+    aliases.dedup();
+    Some(aliases)
+}
+
+/// A physical page held read-only against title CPU writes and remapping.
+/// Keep this alive until every GPU submission that reads the page has finished.
+pub(crate) struct GpuReading {
+    _mapping: Reading,
+    _claims: Claims,
+}
+
+/// Hold every 4 KiB block of a 64 KiB physical page and all its aliases.
+/// This is available only with renderer port #6: its write-fault path honours
+/// the claims and waits until the GPU reader lets them go.
+pub(crate) fn title_memory_gpu_reading(at: usize) -> Option<GpuReading> {
+    const PHYSICAL_PAGE: usize = 64 * 1024;
+    if !port_guard() || !at.is_multiple_of(PHYSICAL_PAGE) {
+        return None;
+    }
+    let mapping = title_memory_reading_now()?;
+    let aliases = crate::inplace::pages_of(at);
+    let aliases = physical_page_aliases(at, aliases)?;
+    if aliases.iter().any(|page| !page.is_multiple_of(PHYSICAL_PAGE)) {
+        return None;
+    }
+    // Ask with guarded=true to make view pages read-only again. Do this for
+    // every alias: protecting only the address used to find the section would
+    // leave another mapping able to modify the same physical bytes.
+    for &page in &aliases {
+        writes(page, page + PHYSICAL_PAGE, true)?;
+    }
+    let mut blocks = Vec::with_capacity(aliases.len() * (PHYSICAL_PAGE / BLOCK));
+    for page in aliases {
+        blocks.extend((page / BLOCK)..((page + PHYSICAL_PAGE) / BLOCK));
+    }
+    blocks.sort_unstable();
+    blocks.dedup();
+    let guards = guards_shared();
+    if blocks.iter().any(|&block| !guards.protected.contains(block)) {
+        return None;
+    }
+    // Fault handlers take GUARDS shared before these claims too. Once held,
+    // a CPU write through any protected alias waits until this lease drops.
+    let claims = Claims::wait_for(&blocks);
+    if blocks.iter().any(|&block| !guards.protected.contains(block)) {
+        return None;
+    }
+    drop(guards);
+    Some(GpuReading { _mapping: mapping, _claims: claims })
+}
 /// What a read of title memory in place holds ([`title_memory_reading`]).
 pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
 
@@ -5958,5 +6021,29 @@ mod rearm_tests {
         assert_eq!(NOT_REARMED.load(Relaxed), before + 2);
         // SAFETY: our allocation.
         unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+
+#[cfg(test)]
+mod gpu_reading_alias_tests {
+    use super::*;
+
+    #[test]
+    fn physical_page_aliases_are_complete_aligned_and_deduplicated() {
+        let at = 0x7_1000_0000usize;
+        assert_eq!(
+            physical_page_aliases(at, vec![at + PAGE, at, at]),
+            Some(vec![at, at + PAGE])
+        );
+        assert_eq!(physical_page_aliases(at, vec![at + 1]), None, "unaligned alias");
+        assert_eq!(physical_page_aliases(at, vec![at + PAGE]), None, "primary view missing");
+        assert_eq!(physical_page_aliases(at, vec![]), None, "no aliases");
+        assert_eq!(
+            physical_page_aliases(at, (0..=MANY_VIEWS).map(|n| at + n * PAGE).collect()),
+            None,
+            "too many aliases"
+        );
+        assert_eq!(physical_page_aliases(at + 1, vec![at + 1]), None, "unaligned primary");
     }
 }

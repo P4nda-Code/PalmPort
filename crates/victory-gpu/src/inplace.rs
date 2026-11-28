@@ -35,7 +35,7 @@
 //!   `VirtualProtect` fail with error 87), nor unmap a view in it. Pages
 //!   outside the opened part are free to change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -319,9 +319,85 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     v.sections.push((section, bytes, committed));
 }
 
+/// Open heaps for committed physical sections, shared by every page in
+/// the section. The D3D12 heap retains the section backing independently of
+/// the title's mapped views. Entries are removed when the runtime releases
+/// the section handle; placed resources retain their own heap references.
+static SECTION_HEAPS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, ID3D12Heap>>> = std::sync::OnceLock::new();
+
+/// The D3D12 heap for a committed title physical section. The caller must
+/// hold `crate::watch::title_memory_reading` so the section handle cannot be
+/// closed or reused while it is opened. Reserved sections are never opened.
+pub(crate) fn section_heap(section: usize) -> Option<ID3D12Heap> {
+    {
+        let v = views();
+        if !v.sections.iter().any(|s| s.0 == section && s.2) {
+            return None;
+        }
+    }
+    let heaps = SECTION_HEAPS.get_or_init(Default::default);
+    let mut heaps = heaps.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(heap) = heaps.get(&section) {
+        return Some(heap.clone());
+    }
+    let host = crate::host::host()?;
+    match open(&host.device, From::Section(section)) {
+        Ok(heap) => {
+            heaps.insert(section, heap.clone());
+            Some(heap)
+        }
+        Err(error) => {
+            tracing::warn!(section, error = %error, "could not open committed physical section as a GPU heap");
+            None
+        }
+    }
+}
+
+/// Placed GPU buffers for individual pages of committed physical sections.
+/// The cache owns one reference until the title releases the section; users
+/// of a returned resource may retain their own references beyond that point.
+static SECTION_PAGE_RESOURCES: std::sync::OnceLock<std::sync::Mutex<HashMap<(usize, u64), ID3D12Resource>>> = std::sync::OnceLock::new();
+
+/// Open or create the GPU buffer that directly views one committed physical
+/// page. This only creates the resource; callers must not expose it to shaders
+/// until CPU/GPU synchronization and remapping are handled by the memory path.
+pub(crate) fn section_page_resource(at: usize) -> Option<(ID3D12Resource, u64, crate::watch::GpuReading)> {
+    // The caller must retain this lease until the submission that reads the
+    // returned resource has passed its fence.
+    let reading = crate::watch::title_memory_gpu_reading(at)?;
+    let (section, offset) = section_page(at)?;
+    let resources = SECTION_PAGE_RESOURCES.get_or_init(Default::default);
+    let mut resources = resources.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(resource) = resources.get(&(section, offset)) {
+        // SAFETY: the cached resource is live.
+        let gpu = unsafe { resource.GetGPUVirtualAddress() };
+        return Some((resource.clone(), gpu, reading));
+    }
+    let heap = section_heap(section)?;
+    let host = crate::host::host()?;
+    let resource = match place(&host.device, &heap, offset, K64 as u64) {
+        Ok(resource) => resource,
+        Err(error) => {
+            tracing::warn!(section, offset, error = %error, "could not create placed buffer for committed physical page");
+            return None;
+        }
+    };
+    crate::host::name(&resource, || format!("physical section {section:#x}+{offset:#x}"));
+    // SAFETY: a live resource.
+    let gpu = unsafe { resource.GetGPUVirtualAddress() };
+    resources.insert((section, offset), resource.clone());
+    Some((resource, gpu, reading))
+}
+
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    if let Some(resources) = SECTION_PAGE_RESOURCES.get() {
+        resources.lock().unwrap_or_else(|e| e.into_inner()).retain(|(owner, _), _| *owner != section);
+    }
+    if let Some(heaps) = SECTION_HEAPS.get() {
+        heaps.lock().unwrap_or_else(|e| e.into_inner()).remove(&section);
+    }
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
@@ -533,6 +609,32 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
+}
+
+/// The committed physical-section backing of one title virtual page, if it
+/// is shown by exactly one contiguous section run. The caller must hold
+/// `crate::watch::title_memory_reading` so the title cannot remap the page
+/// while the returned handle and offset are used. The section heap can then
+/// outlive its mapped views.
+pub(crate) fn section_page(at: usize) -> Option<(usize, u64)> {
+    if !at.is_multiple_of(K64) {
+        return None;
+    }
+    let v = views();
+    section_page_in(&v.views, &v.sections, at)
+}
+
+fn section_page_in(
+    views: &BTreeMap<usize, (usize, usize, u64)>,
+    sections: &[(usize, u64, bool)],
+    at: usize,
+) -> Option<(usize, u64)> {
+    let Cover::Run(section, offset) = cover_in(views, at, K64) else {
+        return None;
+    };
+    let (_, bytes, committed) = sections.iter().find(|s| s.0 == section)?;
+    (*committed && offset.is_multiple_of(K64 as u64) && offset.checked_add(K64 as u64).is_some_and(|end| end <= *bytes))
+        .then_some((section, offset))
 }
 
 /// The whole stretch of views around `[at, at + len)` that follow one
@@ -1361,6 +1463,21 @@ pub(crate) mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    #[test]
+    fn direct_page_backing_requires_one_committed_aligned_section_page() {
+        let mut views = BTreeMap::new();
+        let at = 0x7_1000_0000usize;
+        views.insert(at, (3 * K64, 9, 8 * K64 as u64));
+        let committed = [(9, 16 * K64 as u64, true)];
+        let reserved = [(9, 16 * K64 as u64, false)];
+        assert_eq!(section_page_in(&views, &committed, at + K64), Some((9, 9 * K64 as u64)));
+        assert_eq!(section_page_in(&views, &reserved, at + K64), None);
+        assert_eq!(section_page_in(&views, &committed, at + 1), None, "unaligned title page");
+        assert_eq!(section_page_in(&views, &[(9, 9 * K64 as u64, true)], at + K64), None, "past section end");
+        views.insert(at + 3 * K64, (K64, 10, 0));
+        assert_eq!(section_page_in(&views, &committed, at + 3 * K64), None, "another section");
     }
 
     /// The stretch around a run: views on both sides that follow in memory
