@@ -362,6 +362,10 @@ static SECTION_PAGE_RESOURCES: std::sync::OnceLock<std::sync::Mutex<HashMap<(usi
 /// page. This only creates the resource; callers must not expose it to shaders
 /// until CPU/GPU synchronization and remapping are handled by the memory path.
 pub(crate) fn section_page_resource(at: usize) -> Option<(ID3D12Resource, u64)> {
+    // Keep every mapped alias read-only while opening the backing heap and
+    // creating the placed resource. The probe drops this lease immediately;
+    // actual GPU use must retain it through the submission fence.
+    let _reading = crate::watch::title_memory_gpu_reading(at)?;
     let (section, offset) = section_page(at)?;
     let resources = SECTION_PAGE_RESOURCES.get_or_init(Default::default);
     let mut resources = resources.lock().unwrap_or_else(|e| e.into_inner());
