@@ -6580,6 +6580,10 @@ impl HostList {
     /// Obtain a placed resource for one committed physical page and retain
     /// its CPU-write/remapping lease until this list is reset after its
     /// final submission fence.
+    ///
+    /// This is deliberately staged ahead of page-directory integration; keep
+    /// it available without treating the incomplete path as a live call site.
+    #[allow(dead_code)]
     pub(crate) fn section_page_resource(&self, at: usize) -> Option<(ID3D12Resource, u64)> {
         let (resource, gpu, reading) = crate::inplace::section_page_resource(at)?;
         self.section_readings.lock().unwrap_or_else(|e| e.into_inner()).push(reading);
