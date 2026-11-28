@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::Win32::System::Memory as mem;
 
-use crate::inplace::{Placed, cover, stretch};
+use crate::inplace::{Cover, Placed, cover, stretch};
 
 const K64: u64 = 64 << 10;
 
@@ -102,10 +102,36 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// touch it, their bytes.
 static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
-/// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
-/// memory.
+/// Whether the caller opted into direct placement of other physical-section
+/// views. The legacy 32-bit graphics-memory path remains the default scope.
+fn all_sections() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_ALL_SECTIONS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether `[at, at + len)` may be ported. Direct placement is disabled
+/// whenever late submission is enabled: unlike a shadow, this memory has
+/// no pending-write snapshot or relay to preserve CPU/GPU overlap. By
+/// default this is only the title's known 32-bit graphics heap. The experimental mode admits a range
+/// only when the runtime's view map says the entire range is one contiguous
+/// run of one physical section; `open_region` still checks commitment,
+/// alignment, size and the host driver's acceptance before placement.
+fn eligible(at: u64, len: u64, wide: bool, one_section_run: bool) -> bool {
+    let Some(end) = at.checked_add(len) else { return false };
+    len != 0 && (end <= LOW || (wide && one_section_run))
+}
+
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
+    // Directly shared title memory has no shadow's pending-write tracking.
+    // Late submission permits the CPU to rewrite memory while earlier GPU
+    // work is still in flight, so never opt into this path in that mode.
+    if !on() || crate::host::late() {
+        return false;
+    }
+    let Some(end) = at.checked_add(len) else { return false };
+    let wide = end > LOW && all_sections();
+    let one_section_run = wide && matches!(cover(at as usize, len as usize), Cover::Run(_, _));
+    eligible(at, len, wide, one_section_run)
 }
 
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
@@ -292,7 +318,7 @@ pub(crate) fn log(frames: f64) {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
+        "renderer port 1 (VICTORY_PORT_CONSTANTS=1; VICTORY_PORT_ALL_SECTIONS=1 opts into wider scope): {} regions of title physical memory in place ({} MB), {} title buffers and windows placed in them \
          (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
          forgotten (other pages mapped there)",
@@ -397,5 +423,20 @@ mod tests {
             mem::VirtualFree(hole.add(3 * K).cast(), 0, mem::MEM_RELEASE);
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod eligibility_tests {
+    use super::*;
+
+    #[test]
+    fn experimental_scope_requires_a_contiguous_section_view() {
+        assert!(eligible(0x1_0000_0000, 0x1000, true, true));
+        assert!(!eligible(0x1_0000_0000, 0x1000, true, false));
+        assert!(!eligible(0x1_0000_0000, 0x1000, false, true));
+        assert!(!eligible(u64::MAX - 3, 8, true, true));
+        assert!(!eligible(0x1_0000_0000, 0, true, true));
     }
 }
