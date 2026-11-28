@@ -109,8 +109,10 @@ fn all_sections() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_ALL_SECTIONS").is_ok_and(|v| v.trim() == "1"))
 }
 
-/// Whether `[at, at + len)` may be ported. By default this is only the
-/// title's known 32-bit graphics heap. The experimental mode admits a range
+/// Whether `[at, at + len)` may be ported. Direct placement is disabled
+/// whenever late submission is enabled: unlike a shadow, this memory has
+/// no pending-write snapshot or relay to preserve CPU/GPU overlap. By
+/// default this is only the title's known 32-bit graphics heap. The experimental mode admits a range
 /// only when the runtime's view map says the entire range is one contiguous
 /// run of one physical section; `open_region` still checks commitment,
 /// alignment, size and the host driver's acceptance before placement.
@@ -120,7 +122,10 @@ fn eligible(at: u64, len: u64, wide: bool, one_section_run: bool) -> bool {
 }
 
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    if !on() {
+    // Directly shared title memory has no shadow's pending-write tracking.
+    // Late submission permits the CPU to rewrite memory while earlier GPU
+    // work is still in flight, so never opt into this path in that mode.
+    if !on() || crate::host::late() {
         return false;
     }
     let Some(end) = at.checked_add(len) else { return false };
