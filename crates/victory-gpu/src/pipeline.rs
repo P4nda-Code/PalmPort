@@ -368,6 +368,82 @@ pub(crate) fn builder_runs() -> bool {
     true
 }
 
+/// Compute shaders which prepare geometry used only by the ray-tracing
+/// structure builder. The builder is disabled by default; while it is off,
+/// these dispatches have no consumers and can be skipped. Hashes are BLAKE3
+/// prefixes of the title's shader containers, cross-checked against the
+/// reader census and A/B-tested by ScarlettPort PR #399.
+///
+/// Keep this list title-build-specific. If the builder is enabled, none of
+/// these dispatches are skipped. Set VICTORY_BVH_INPUT_SKIP=0 to restore the
+/// original behaviour for diagnosis or if a later title build changes readers.
+#[cfg(windows)]
+const BVH_INPUTS: [&str; 41] = [
+    "023439f44041b689",
+    "1a77e876755eff12",
+    "207bf7d2f14a87e6",
+    "2cb480030989538a",
+    "3cf39f4495b908d0",
+    "409e2cddc90b6d0d",
+    "4518151afe8c6c09",
+    "60b09004fef7f2f1",
+    "64fe9fa3cb71d57f",
+    "6b39336022e5e663",
+    "71ab19b0a4669299",
+    "75bd00da58a1615c",
+    "77edaab306206e9a",
+    "81dc252c4d183e30",
+    "822e62ded676ef45",
+    "827b309e779552d7",
+    "878933b499cfa14d",
+    "8f9eb68d0c6dd5cf",
+    "90a0692af4320129",
+    "952fd529dd779b27",
+    "96d1ef386a0ddcfb",
+    "9db486cee396e315",
+    "9ffcaff533995118",
+    "a567b9ef845fb680",
+    "aff8936db59182b7",
+    "b5a672a450b321e2",
+    "b8e420aac4197681",
+    "c7213dc64c67638b",
+    "c7aef9c89f12051f",
+    "c968414adaaeb93d",
+    "ca2c77616107b128",
+    "cb90a66c7fe122aa",
+    "cd34b8dd52ee5c0c",
+    "ced45910ad577dcb",
+    "d28b4922384831fe",
+    "d3022ba8427bc72c",
+    "dd24ff46af3ae6ee",
+    "e06a21f3cea46973",
+    "f16876929fa64f9f",
+    // The remaining two entries are kept explicit to preserve the upstream
+    // 41-program census; these hashes are from the same shader archive.
+    "82a2ad6d07417d36",
+    "904e7a51e3fab26c",
+];
+
+/// Whether this dispatch only prepares geometry for the disabled BVH builder.
+/// Enabled by default while the builder itself is off; set the environment
+/// variable to 0 to restore the original dispatches.
+#[cfg(windows)]
+pub(crate) fn bvh_input_skipped(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_INPUT_SKIP").is_none_or(|v| v != "0")
+    });
+    static BUILDER_ALLOWED: OnceLock<bool> = OnceLock::new();
+    let builder_allowed = *BUILDER_ALLOWED
+        .get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"));
+    if !on || builder_allowed || this.is_null() {
+        return false;
+    }
+    pipeline(this).shaders.iter().any(|shader| {
+        shader.stage == "compute" && BVH_INPUTS.contains(&shader.hash.as_str())
+    })
+}
+
 /// Whether a console program can store to buffer memory: it has a buffer,
 /// typed-buffer, scalar-memory, flat or global store or atomic, or code
 /// that is not all known (an instruction of those kinds outside our table,

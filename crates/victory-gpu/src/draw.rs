@@ -3115,6 +3115,20 @@ impl State {
             }
             return;
         }
+        // These geometry skinning/deformation dispatches feed only the
+        // ray-tracing structure builder. When that builder is off, their
+        // outputs are unused; skipping them avoids dozens of empty GPU jobs.
+        if crate::pipeline::bvh_input_skipped(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_why(
+                    "ray-tracing geometry input dispatch skipped while the builder is off".to_owned(),
+                );
+                self.list_dropped_roots([x, y, z]);
+            }
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
