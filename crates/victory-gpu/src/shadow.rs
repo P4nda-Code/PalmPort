@@ -311,8 +311,8 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
 /// O(1) lookup for copies whose CPU side changed. The hot submission path
 /// drains only IDs placed in CARD_TOUCHED instead of walking every card copy.
-static CARD_BY_ID: Mutex<std::collections::HashMap<u64, std::sync::Weak<Shadow>>> =
-    Mutex::new(std::collections::HashMap::new());
+static CARD_BY_ID: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, std::sync::Weak<Shadow>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 static CARD_TOUCHED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static CARD_DIRTY_CALLS: AtomicU64 = AtomicU64::new(0);
 
