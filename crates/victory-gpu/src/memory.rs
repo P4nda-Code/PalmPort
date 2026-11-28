@@ -194,6 +194,8 @@ struct Stats {
     unknown: u64,
     /// Pages mapped as one aligned page of a committed physical section.
     section_eligible: u64,
+    /// Eligible pages for which a D3D12 placed resource was successfully created.
+    section_resources: u64,
     back: u64,
     /// Pages looked at, bytes that changed, packed structures sent.
     looked: u64,
@@ -295,8 +297,16 @@ impl Memory {
             self.refused.insert(page);
             self.stats.unknown += 1;
         } else if crate::inplace::section_page(at).is_some() {
-            // Census only: direct use still needs GPU/CPU access synchronization.
+            // Direct resources are created only in explicit probe mode. They
+            // remain outside the shader-visible directory until synchronization
+            // and remapping are integrated.
             self.stats.section_eligible += 1;
+            static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *PROBE.get_or_init(|| std::env::var_os("VICTORY_SECTION_HEAP_PROBE").is_some_and(|v| v == "1"))
+                && crate::inplace::section_page_resource(at).is_some()
+            {
+                self.stats.section_resources += 1;
+            }
         }
         ours
     }
@@ -770,7 +780,7 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, committed-section candidates {:.1}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, committed-section candidates {:.1}, placed page resources {:.1}, faults in all {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -793,6 +803,7 @@ impl Memory {
             s.came[2],
             s.came[3],
             s.section_eligible as f64 / frames,
+            s.section_resources as f64 / frames,
             self.faulted
         );
         self.stats.from = Some((now, self.frame));
