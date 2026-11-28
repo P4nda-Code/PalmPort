@@ -192,6 +192,8 @@ struct Stats {
     uses: [u64; 2],
     faults: u64,
     unknown: u64,
+    /// Pages mapped as one aligned page of a committed physical section.
+    section_eligible: u64,
     back: u64,
     /// Pages looked at, bytes that changed, packed structures sent.
     looked: u64,
@@ -292,6 +294,9 @@ impl Memory {
         if !ours {
             self.refused.insert(page);
             self.stats.unknown += 1;
+        } else if crate::inplace::section_page(at).is_some() {
+            // Census only: direct use still needs GPU/CPU access synchronization.
+            self.stats.section_eligible += 1;
         }
         ours
     }
@@ -765,7 +770,7 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, committed-section candidates {:.1}, faults in all {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -787,6 +792,7 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
+            s.section_eligible as f64 / frames,
             self.faulted
         );
         self.stats.from = Some((now, self.frame));
