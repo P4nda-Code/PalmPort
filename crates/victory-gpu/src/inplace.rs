@@ -545,10 +545,18 @@ pub(crate) fn section_page(at: usize) -> Option<(usize, u64)> {
         return None;
     }
     let v = views();
-    let Cover::Run(section, offset) = cover_in(&v.views, at, K64) else {
+    section_page_in(&v.views, &v.sections, at)
+}
+
+fn section_page_in(
+    views: &BTreeMap<usize, (usize, usize, u64)>,
+    sections: &[(usize, u64, bool)],
+    at: usize,
+) -> Option<(usize, u64)> {
+    let Cover::Run(section, offset) = cover_in(views, at, K64) else {
         return None;
     };
-    let (_, bytes, committed) = v.sections.iter().find(|s| s.0 == section)?;
+    let (_, bytes, committed) = sections.iter().find(|s| s.0 == section)?;
     (*committed && offset.is_multiple_of(K64 as u64) && offset.checked_add(K64 as u64).is_some_and(|end| end <= *bytes))
         .then_some((section, offset))
 }
@@ -1379,6 +1387,21 @@ pub(crate) mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    #[test]
+    fn direct_page_backing_requires_one_committed_aligned_section_page() {
+        let mut views = BTreeMap::new();
+        let at = 0x7_1000_0000usize;
+        views.insert(at, (3 * K64, 9, 8 * K64 as u64));
+        let committed = [(9, 16 * K64 as u64, true)];
+        let reserved = [(9, 16 * K64 as u64, false)];
+        assert_eq!(section_page_in(&views, &committed, at + K64), Some((9, 9 * K64 as u64)));
+        assert_eq!(section_page_in(&views, &reserved, at + K64), None);
+        assert_eq!(section_page_in(&views, &committed, at + 1), None, "unaligned title page");
+        assert_eq!(section_page_in(&views, &[(9, 9 * K64 as u64, true)], at + K64), None, "past section end");
+        views.insert(at + 3 * K64, (K64, 10, 0));
+        assert_eq!(section_page_in(&views, &committed, at + 3 * K64), None, "another section");
     }
 
     /// The stretch around a run: views on both sides that follow in memory
