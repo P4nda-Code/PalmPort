@@ -509,6 +509,12 @@ impl Memory {
         }
         let started = std::time::Instant::now();
         let answer = crate::watch::writes((first * PAGE) as usize, (end * PAGE) as usize, true);
+
+        // First identify stale pages and advance their page-level journal
+        // cursors. The write-watch journal also retains a 4 KiB dirty mask
+        // for each 64 KiB console page; use it below so a small CPU write
+        // does not force sixteen host reads and comparisons.
+        let mut stale = Vec::new();
         for page in first..end {
             let Some(held) = self.pages.get_mut(&page) else {
                 continue;
@@ -522,15 +528,34 @@ impl Memory {
                 .as_ref()
                 .map(|(_, w)| w.binary_search_by_key(&(page as usize), |w| w.0).map_or(0, |i| w[i].1));
             let now = answer.as_ref().map_or(1, |a| a.0);
-            let stale = held.taken == 0 || wrote.is_none_or(|w| w > held.taken);
-            if !stale {
+            let old_taken = held.taken;
+            if old_taken != 0 && wrote.is_some_and(|w| w <= old_taken) {
                 continue;
             }
-            let never = std::mem::replace(&mut held.taken, now.max(1)) == 0;
+            let never = old_taken == 0;
+            held.taken = now.max(1);
+            stale.push((page, old_taken, never));
+        }
+
+        let journal_pages: Vec<(usize, u64)> = stale.iter().map(|&(page, taken, _)| (page as usize, taken)).collect();
+        let dirty_parts = crate::watch::parts_written(&journal_pages);
+        for ((page, _, never), mut mask) in stale.into_iter().zip(dirty_parts) {
+            // A missing/unknown sub-page mask must conservatively refresh the
+            // whole console page. This also covers the first-ever take.
+            if never || mask == 0 {
+                mask = u16::MAX;
+            }
+            let Some(held) = self.pages.get(&page) else {
+                continue;
+            };
             let shadow = &self.copies[held.copy];
             let base = held.at - shadow.span().0 as usize;
             let mut title = [0u8; PIECE];
-            for piece in (0..PAGE as usize).step_by(PIECE) {
+            for part in 0..(PAGE as usize / PIECE) {
+                if mask & (1u16 << part) == 0 {
+                    continue;
+                }
+                let piece = part * PIECE;
                 let from = (page * PAGE) as usize + piece;
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
