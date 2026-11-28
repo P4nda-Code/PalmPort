@@ -199,6 +199,7 @@ pub fn title_memory_freeing(at: usize, len: usize) {
         return;
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
+    crate::memory::forget_direct_pages(at, len);
     STATS[7].fetch_add(gone, Ordering::Relaxed);
 }
 
@@ -563,7 +564,7 @@ pub(crate) fn place_section_page(at: usize) -> Option<(Placed, usize, usize)> {
     if std::env::var_os("VICTORY_UMA_SECTION_PAGES").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return None;
     }
-    let _reading = crate::watch::title_memory_reading();
+    // Caller holds `watch::title_memory_reading` across descriptor setup.
     let (section, offset) = section_page(at)?;
     let (data, _) = beside_page(at)?;
     let host = crate::host::host()?;
