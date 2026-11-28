@@ -3145,8 +3145,18 @@ impl Shadow {
     /// that binds, views or keeps a copy works on it unchanged; what
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
+        Self::placed_at(placed, start as *mut u8, start, len, window)
+    }
+
+    /// A physical-section page has a stable side view of its backing section;
+    /// use that address rather than the title's remappable virtual alias.
+    pub(crate) fn placed_section(placed: crate::inplace::Placed, data: usize, start: u64, len: u64) -> Shadow {
+        Self::placed_at(placed, data as *mut u8, start, len, false)
+    }
+
+    fn placed_at(placed: crate::inplace::Placed, data: *mut u8, start: u64, len: u64, window: bool) -> Shadow {
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
-        let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
+        let mut shadow = Shadow::new(placed.buffer, data, placed.gpu, start, len);
         // Not a copy: not counted with them, and nothing asks what the
         // title wrote there.
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
