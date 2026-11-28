@@ -3589,6 +3589,56 @@ pub fn title_memory_remapping() -> Remapping {
     Remapping(changing)
 }
 
+/// A physical page held read-only against title CPU writes and remapping.
+/// Keep this alive until every GPU submission that reads the page has finished.
+pub(crate) struct GpuReading {
+    _mapping: Reading,
+    _claims: Claims,
+}
+
+/// Hold every 4 KiB block of a 64 KiB physical page and all its aliases.
+/// This is available only with renderer port #6: its write-fault path honours
+/// the claims and waits until the GPU reader lets them go.
+pub(crate) fn title_memory_gpu_reading(at: usize) -> Option<GpuReading> {
+    const PHYSICAL_PAGE: usize = 64 * 1024;
+    if !port_guard() || !at.is_multiple_of(PHYSICAL_PAGE) {
+        return None;
+    }
+    let mapping = title_memory_reading_now()?;
+    let mut aliases = crate::inplace::pages_of(at);
+    if aliases.is_empty() || aliases.len() > MANY_VIEWS || !aliases.contains(&at) {
+        return None;
+    }
+    aliases.sort_unstable();
+    aliases.dedup();
+    if aliases.iter().any(|page| !page.is_multiple_of(PHYSICAL_PAGE)) {
+        return None;
+    }
+    // Ask with guarded=true to make view pages read-only again. Do this for
+    // every alias: protecting only the address used to find the section would
+    // leave another mapping able to modify the same physical bytes.
+    for &page in &aliases {
+        writes(page, page + PHYSICAL_PAGE, true)?;
+    }
+    let mut blocks = Vec::with_capacity(aliases.len() * (PHYSICAL_PAGE / BLOCK));
+    for page in aliases {
+        blocks.extend((page / BLOCK)..((page + PHYSICAL_PAGE) / BLOCK));
+    }
+    blocks.sort_unstable();
+    blocks.dedup();
+    let guards = guards_shared();
+    if blocks.iter().any(|&block| !guards.protected.contains(block)) {
+        return None;
+    }
+    // Fault handlers take GUARDS shared before these claims too. Once held,
+    // a CPU write through any protected alias waits until this lease drops.
+    let claims = Claims::wait_for(&blocks);
+    if blocks.iter().any(|&block| !guards.protected.contains(block)) {
+        return None;
+    }
+    drop(guards);
+    Some(GpuReading { _mapping: mapping, _claims: claims })
+}
 /// What a read of title memory in place holds ([`title_memory_reading`]).
 pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
 
