@@ -353,9 +353,45 @@ pub(crate) fn section_heap(section: usize) -> Option<ID3D12Heap> {
     }
 }
 
+/// Placed GPU buffers for individual pages of committed physical sections.
+/// The cache owns one reference until the title releases the section; users
+/// of a returned resource may retain their own references beyond that point.
+static SECTION_PAGE_RESOURCES: std::sync::OnceLock<std::sync::Mutex<HashMap<(usize, u64), ID3D12Resource>>> = std::sync::OnceLock::new();
+
+/// Open or create the GPU buffer that directly views one committed physical
+/// page. This only creates the resource; callers must not expose it to shaders
+/// until CPU/GPU synchronization and remapping are handled by the memory path.
+pub(crate) fn section_page_resource(at: usize) -> Option<(ID3D12Resource, u64)> {
+    let (section, offset) = section_page(at)?;
+    let resources = SECTION_PAGE_RESOURCES.get_or_init(Default::default);
+    let mut resources = resources.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(resource) = resources.get(&(section, offset)) {
+        // SAFETY: the cached resource is live.
+        let gpu = unsafe { resource.GetGPUVirtualAddress() };
+        return Some((resource.clone(), gpu));
+    }
+    let heap = section_heap(section)?;
+    let host = crate::host::host()?;
+    let resource = match place(&host.device, &heap, offset, K64 as u64) {
+        Ok(resource) => resource,
+        Err(error) => {
+            tracing::warn!(section, offset, error = %error, "could not create placed buffer for committed physical page");
+            return None;
+        }
+    };
+    crate::host::name(&resource, || format!("physical section {section:#x}+{offset:#x}"));
+    // SAFETY: a live resource.
+    let gpu = unsafe { resource.GetGPUVirtualAddress() };
+    resources.insert((section, offset), resource.clone());
+    Some((resource, gpu))
+}
+
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    if let Some(resources) = SECTION_PAGE_RESOURCES.get() {
+        resources.lock().unwrap_or_else(|e| e.into_inner()).retain(|(owner, _), _| *owner != section);
+    }
     if let Some(heaps) = SECTION_HEAPS.get() {
         heaps.lock().unwrap_or_else(|e| e.into_inner()).remove(&section);
     }
