@@ -361,18 +361,17 @@ static SECTION_PAGE_RESOURCES: std::sync::OnceLock<std::sync::Mutex<HashMap<(usi
 /// Open or create the GPU buffer that directly views one committed physical
 /// page. This only creates the resource; callers must not expose it to shaders
 /// until CPU/GPU synchronization and remapping are handled by the memory path.
-pub(crate) fn section_page_resource(at: usize) -> Option<(ID3D12Resource, u64)> {
-    // Keep every mapped alias read-only while opening the backing heap and
-    // creating the placed resource. The probe drops this lease immediately;
-    // actual GPU use must retain it through the submission fence.
-    let _reading = crate::watch::title_memory_gpu_reading(at)?;
+pub(crate) fn section_page_resource(at: usize) -> Option<(ID3D12Resource, u64, crate::watch::GpuReading)> {
+    // The caller must retain this lease until the submission that reads the
+    // returned resource has passed its fence.
+    let reading = crate::watch::title_memory_gpu_reading(at)?;
     let (section, offset) = section_page(at)?;
     let resources = SECTION_PAGE_RESOURCES.get_or_init(Default::default);
     let mut resources = resources.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(resource) = resources.get(&(section, offset)) {
         // SAFETY: the cached resource is live.
         let gpu = unsafe { resource.GetGPUVirtualAddress() };
-        return Some((resource.clone(), gpu));
+        return Some((resource.clone(), gpu, reading));
     }
     let heap = section_heap(section)?;
     let host = crate::host::host()?;
@@ -387,7 +386,7 @@ pub(crate) fn section_page_resource(at: usize) -> Option<(ID3D12Resource, u64)> 
     // SAFETY: a live resource.
     let gpu = unsafe { resource.GetGPUVirtualAddress() };
     resources.insert((section, offset), resource.clone());
-    Some((resource, gpu))
+    Some((resource, gpu, reading))
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
