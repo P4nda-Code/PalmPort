@@ -35,7 +35,7 @@
 //!   `VirtualProtect` fail with error 87), nor unmap a view in it. Pages
 //!   outside the opened part are free to change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -311,6 +311,7 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    SECTION_HEAPS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).remove(&section);
     let mut v = views_mut();
     v.sections.retain(|s| s.0 != section);
     // A handle's number given out again: the view was of the section that
@@ -322,6 +323,8 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    crate::memory::forget_section_pages(section);
+    SECTION_HEAPS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).remove(&section);
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
@@ -546,6 +549,34 @@ pub(crate) fn section_page(at: usize) -> Option<(usize, u64)> {
     }
     let v = views();
     section_page_in(&v.views, &v.sections, at)
+}
+
+/// Open one committed physical page as a placed GPU buffer. This is opt-in:
+/// the section heap shares the title's backing pages directly with the GPU.
+/// The mapping read lock keeps the section view stable while its metadata and
+/// stable side-view address are resolved.
+pub(crate) fn place_section_page(at: usize) -> Option<(Placed, usize, usize)> {
+    if std::env::var_os("VICTORY_UMA_SECTION_PAGES").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return None;
+    }
+    let _reading = crate::watch::title_memory_reading();
+    let (section, offset) = section_page(at)?;
+    let (data, _) = beside_page(at)?;
+    let host = crate::host::host()?;
+    static HEAPS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, ID3D12Heap>>> = std::sync::OnceLock::new();
+    let mut heaps = HEAPS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let heap = if let Some(heap) = heaps.get(&section) {
+        heap.clone()
+    } else {
+        let heap = open(&host.device, From::Section(section)).ok()?;
+        heaps.insert(section, heap.clone());
+        heap
+    };
+    let buffer = place(&host.device, &heap, offset, K64 as u64).ok()?;
+    // SAFETY: a live placed buffer in the section heap.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    counted(false, K64 as u64);
+    Some((Placed { buffer, heap, gpu, bias: 0 }, data, section))
 }
 
 fn section_page_in(
