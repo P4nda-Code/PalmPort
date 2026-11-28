@@ -812,12 +812,13 @@ impl Memory {
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
         let s = std::mem::take(&mut self.stats);
         tracing::info!(
-            "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
+            "title memory by address: {} pages ({} MB; {} direct from physical sections) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
              and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
-            self.pages.len(),
-            (self.pages.len() as u64 * PAGE) >> 20,
+            self.pages.len() + self.direct_pages.len(),
+            ((self.pages.len() + self.direct_pages.len()) as u64 * PAGE) >> 20,
+            self.direct_pages.len(),
             self.arenas.len(),
             self.copies.len(),
             s.uses[0] as f64 / frames,
