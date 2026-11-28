@@ -297,9 +297,13 @@ impl Memory {
             self.refused.insert(page);
             self.stats.unknown += 1;
         } else if crate::inplace::section_page(at).is_some() {
-            // Direct resources are created only in explicit probe mode. They
-            // remain outside the shader-visible directory until synchronization
-            // and remapping are integrated.
+            // Direct resources are created only in explicit probe mode. Do
+            // not put them in the directory yet: entries are monotonic (empty
+            // to filled), and the entry also controls whether shader stores
+            // are allowed. A page first exposed read-only cannot later become
+            // a writable arena page, while exposing it writable would let the
+            // builder store into arbitrary title memory. The directory needs
+            // a replaceable, permission-aware mapping before this is safe.
             self.stats.section_eligible += 1;
             static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if *PROBE.get_or_init(|| std::env::var_os("VICTORY_SECTION_HEAP_PROBE").is_some_and(|v| v == "1"))
